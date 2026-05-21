@@ -25,6 +25,7 @@ manage-cluster/
     ├── manage-albs.sh        # create/delete ALBs + emit DNS + service-LB templates
     ├── update-service-alb.sh # replace/clear/append/detach-one loadBalancers on ECS services
     ├── apply-listeners.sh    # create/update ALB listeners (tier-2 scope)
+    ├── manage-vpce.sh        # create/delete VPC endpoints (Interface/Gateway) + optional per-endpoint policy
     ├── setup.sh              # one-shot wrapper: provision -> listeners -> services -> DNS
     ├── teardown.sh           # one-shot wrapper: DNS delete -> detach -> delete ALBs
     └── config/               # INI/text configs consumed by the scripts above
@@ -310,22 +311,37 @@ rather than handle.
 ## Setup and teardown ordering
 
 The five scripts that touch the LB layer form a pipeline with a strict
-dependency order. README documents the user-facing commands; the
-invariants worth remembering when extending:
+dependency order, with `manage-vpce.sh` as an opt-in book-end on either
+side. README documents the user-facing commands; the invariants worth
+remembering when extending:
 
-**Setup order** is `ALB → listeners → services → DNS`. Each step
+**Setup order** is `[VPCE →] ALB → listeners → services → DNS`. Each step
 unblocks the next:
+- new ECS tasks (started in the service-wire step) need ECR / logs /
+  secrets endpoints reachable, which is what the VPCE step provides;
 - listeners can't attach to an ALB that doesn't exist;
 - a listener with `forward` action serves 502 until the target group has
   healthy registered targets (which `update-service-alb.sh` provides);
 - pointing DNS at a half-built ALB exposes errors to clients.
 
-**Teardown order is the reverse**, `DNS → services → ALB`, for the same
-reasons run backwards:
+VPCE goes first (when the optional 5th positional arg is passed to
+`setup.sh`) because it has no dependency on the LB layer and the ECS step
+later in the pipeline depends on it. The ALB doesn't need VPCEs, so if
+`setup.sh` is being used purely to re-provision the LB shell (services
+already paused), skip the VPCE arg.
+
+**Teardown order is the reverse**, `DNS → services → ALB [→ VPCE]`, for
+the same reasons run backwards:
 - removing DNS first stops *new* connections at the resolver level;
 - detaching services next drains *existing* connections via the LB's
   deregistration delay;
-- deleting the ALB last is then a no-op for clients.
+- deleting the ALB last is then a no-op for clients;
+- VPCEs go last (when the optional 4th positional arg is passed to
+  `teardown.sh`) because their delete is harmless to LB-layer resources
+  but **breaks any still-running ECS task** that depends on them. The
+  wrapper logs an explicit warning before confirmation, but the caller is
+  expected to have stopped ECS tasks (e.g. via `shutdown.sh`) before
+  running teardown with the VPCE arg.
 
 Deleting an ALB cascades to its listeners (AWS-side). Target groups are
 **not** cascaded — they're independent resources, and this repo
@@ -334,13 +350,16 @@ above). A teardown leaves TGs orphaned, which is fine because Terraform
 or the deploy workflow in `../charity-chest` owns them.
 
 `teardown.sh` is the one-shot wrapper for this sequence. It is a **pure
-sequencer** — it shells out to the same three scripts in order and adds
-two thin affordances:
+sequencer** — it shells out to the three (or four, with VPCE) child
+scripts in order and adds these thin affordances:
 1. one up-front confirmation, then `export ASSUME_YES=1` so the children
    don't re-prompt;
 2. a `sleep ${DRAIN_SECONDS:-30}` between the service-detach step and the
    ALB-delete step, so existing LB connections finish draining before the
-   ALB disappears.
+   ALB disappears;
+3. an explicit warning when the optional VPCE arg is supplied, reminding
+   the operator that VPCE delete will break any still-running ECS task
+   that depends on those endpoints.
 
 The wrapper does **not** reimplement any teardown logic. If you find
 yourself adding teardown behavior, put it in the relevant child script
@@ -351,18 +370,33 @@ idempotent and the inter-step delay that actually matters (LB drain) is
 modeled explicitly.
 
 `setup.sh` is the symmetric wrapper for the reverse direction. Same shim
-discipline: it shells out to `manage-albs.sh create`, `apply-listeners.sh`,
+discipline: it shells out to `manage-vpce.sh create` (if the optional arg
+is supplied), `manage-albs.sh create`, `apply-listeners.sh`,
 `update-service-alb.sh`, and `apply-dns-records.sh` in order, with one
 up-front confirmation and `ASSUME_YES=1` exported to the children.
 
-The only setup-specific affordance is the **auto-skip of step 3** when
-`manage-albs.sh` emitted a header-only `service-lbs.conf` (no
+The only setup-specific affordance is the **auto-skip of the service-wire
+step** when `manage-albs.sh` emitted a header-only `service-lbs.conf` (no
 `ecs_service.*` blocks in `albs.conf`). The wrapper detects this by
 grepping for any `^\[` section header in the emitted file before
 invoking `update-service-alb.sh`. Without that guard the child errors
 on a zero-section config and the wrapper crashes mid-pipeline. If
 future child scripts grow similar "empty input = error" behavior, add an
 equivalent guard here.
+
+Both wrappers expose the VPCE step as an **optional positional arg**
+(5th for setup, 4th for teardown). Omitting it preserves the original
+4-step / 3-step behaviour byte-for-byte. The opt-in design is deliberate:
+many setup invocations (LB-only re-provision, dev iteration on listener
+configs) don't want to touch VPCEs, and silently provisioning or deleting
+them would be a footgun. When extending, keep the arg optional — don't
+promote it to a required input.
+
+Step numbering in log lines reflects the total dynamically: `1/4..4/4`
+without VPCE, `1/5..5/5` with VPCE. Variables (`VPCE_STEP`, `ALB_STEP`,
+`LISTENER_STEP`, `SERVICE_STEP`, `DNS_STEP`) compute the labels once at
+the top and are reinjected into the `log` calls — don't hard-code step
+numbers, or you'll drift between the two modes.
 
 What setup deliberately does **not** do:
 - No inter-step delay. There is no setup analog of the LB drain wait:
@@ -390,6 +424,134 @@ would lose the ability to pause without re-provisioning the LB shell on
 every resume (which is much slower and changes the ALB DNS name, which
 in turn breaks DNS records).
 
+`manage-vpce.sh` participates in the LB-teardown / LB-setup pipeline via
+opt-in args on the two wrappers, but it is **not** on the pause/resume
+axis — `shutdown.sh`/`startup.sh` deliberately don't touch VPCEs.
+Rationale: pause/resume is meant to be fast (~30s to scale down,
+~10 minutes if `WAIT_FOR_RDS=1`), and recreating an interface endpoint
+adds ~1 minute per endpoint per region on resume. For nightly pauses
+that's pure overhead; for week-plus pauses or true teardowns the savings
+justify the latency, which is why the VPCE arg lives on `setup.sh` /
+`teardown.sh` (intent: full-fidelity provision/teardown) rather than
+`shutdown.sh` / `startup.sh` (intent: keep state, minimize cycle time).
+
+## VPC endpoints via `manage-vpce.sh`
+
+The script's scope is the **endpoint resource itself** — its type, target
+service, subnet/SG/route-table associations, policy document, and tags.
+Everything around it is excluded by design:
+
+- VPCs, subnets, route tables, security groups — created out of band
+  (Terraform in `../charity-chest`).
+- The private hosted-zone records auto-published by AWS when
+  `private_dns_enabled=true` — AWS-managed; they appear and disappear with
+  the endpoint and are not a separate thing for this script to manage.
+- Modifying a live endpoint — see "Modify is out of scope" below.
+
+Drift caveat worth flagging in the docs and in PRs: VPC endpoints are
+often Terraform-owned in the sibling repo. Deleting them with this script
+will surface as drift on the next `terraform apply`. The header docstring
+and README both call this out — don't silently drop the warning when
+extending.
+
+### Idempotency design
+
+Endpoint identity on AWS is the `VpcEndpointId`, but that's an opaque
+generated ID — useless as a config primary key. The script uses
+`(vpc_id, service_name)` instead: AWS only allows one Interface/Gateway
+endpoint per service per VPC, so this is the natural primary key.
+`describe-vpc-endpoints` filtered by
+`Name=vpc-id,Values=X Name=service-name,Values=Y` resolves the section
+back to its endpoint ID for delete.
+
+This is a deliberate departure from `manage-albs.sh`'s "section header IS
+the resource name" convention. Reason: VPC endpoints don't have a true
+`name` field on the AWS side (unlike ALBs, which `describe-load-balancers
+--names X` accepts directly) — only an opaque ID and tags. Looking up by
+`Name` tag would force users to pre-tag pre-existing endpoints before
+this script could touch them, which is a footgun. Looking up by
+`service-name` works regardless of how the endpoint was created (Console,
+Terraform, this script).
+
+The section header is still applied as the `Name` tag at create time —
+purely for Console readability, not for lookup. The script refuses a
+`Name` key inside `tags=` so the section header is the single source of
+truth for the user-visible name. Don't relax that — even though Name isn't
+load-bearing for identity anymore, having two places to set it leads to
+confusing diffs in the Console.
+
+`delete` requires both `vpc_id` and `service_name` in the section
+(enforced up front by `validate_for_delete`) since the lookup now needs
+the service name. A "section-header-only" delete config (like the one
+`manage-albs.sh delete` accepts) is therefore not valid here — that
+asymmetry is the cost of having a real primary key.
+
+### Modify is out of scope
+
+Changing `service_name` or `vpc_id` requires a recreate anyway (AWS won't
+modify those in place). Subnets, SGs, and the policy document *can* be
+modified live via `ec2 modify-vpc-endpoint`, but the cost-management use
+case this script addresses doesn't need it — pauses delete and recreates
+fresh from config. Adding a modify path would also force a real "diff"
+implementation (compare desired vs. current subnets/SGs/policy across the
+two endpoint types), which is the kind of complexity the rest of this
+repo deliberately avoids. If a real need shows up, discuss before adding
+— it's a meaningful scope expansion.
+
+### Policy attachment
+
+`policy_file` per section, resolved relative to the **config file's
+directory** (not CWD, not `SCRIPT_DIR`). That gives a "policies live next
+to the config that references them" layout, and means a config can be
+checked into the repo and run from anywhere without breaking path
+resolution. Readability is validated up front so the whole batch fails
+fast before any AWS calls.
+
+The policy is embedded into the endpoint resource via
+`--policy-document file://...` — there is no separate "policy attach"
+step, and therefore no extra IAM permission needed. Don't refactor to
+upload the policy somewhere else first; the inline file:// form is the
+ELBv2/EC2 idiom.
+
+If `policy_file` is omitted, AWS applies its default full-access policy.
+That's deliberately the same default as the AWS Console — surprise the
+operator only when they explicitly ask for restriction.
+
+### Interface vs. Gateway
+
+The two endpoint types take **disjoint** key sets — subnets/SGs/private
+DNS for Interface; route tables for Gateway. The script validates this up
+front and refuses configs that mix them, rather than letting the AWS CLI
+reject the call with a less helpful error. When extending, keep the same
+shape: declare which type a key belongs to and validate in `validate_endpoint`.
+
+### Optional in the LB pipeline
+
+`manage-vpce.sh` is wired into both `setup.sh` (optional 5th positional
+arg) and `teardown.sh` (optional 4th). It runs **first** on setup (VPCEs
+before ALBs, so ECS tasks that come up in the service-wire step have
+ECR/logs/secrets reachable) and **last** on teardown (after ALB delete,
+since neither resource depends on the other).
+
+Setup-side ordering rationale is straightforward — network endpoints
+before compute. Teardown-side has the footgun: deleting VPCEs while ECS
+tasks are still running causes those tasks to start failing (ECR pulls
+time out, log shipping fails, secret lookups error). `teardown.sh` does
+**not** stop ECS tasks — it only detaches services from LB target groups.
+So when the VPCE arg is supplied, the wrapper logs an explicit warning
+before the confirmation prompt; the caller is expected to have already
+scaled services to 0 (typically via `shutdown.sh`). Don't try to enforce
+this in the wrapper by, say, refusing to proceed if any task is running —
+the false-positive rate is too high (a long-running migration container,
+a sidecar that doesn't use VPCEs) and `teardown.sh` is meant to be a
+pure sequencer.
+
+The VPCE arg is intentionally optional on both wrappers, not required:
+many setup invocations only re-provision the LB shell (services already
+paused), and many teardowns only remove the LB layer because VPCEs are
+managed elsewhere (Terraform in `../charity-chest`). Keep it that way —
+don't promote to a required arg.
+
 ## `scripts/config/` directory convention
 
 Hand-authored INI/text configs and the templates emitted by
@@ -407,6 +569,10 @@ Hand-authored INI/text configs and the templates emitted by
   `remove_target_group_arn` sections, input to `update-service-alb.sh`
   (for the teardown path)
 - `listeners.conf` — hand-authored, input to `apply-listeners.sh`
+- `vpce.conf` — hand-authored, input to `manage-vpce.sh create|delete`.
+  Per-endpoint policy JSON files live alongside it (e.g. under
+  `scripts/config/policies/`) since `manage-vpce.sh` resolves
+  `policy_file` paths relative to the config file's directory.
 
 The directory is not a hard contract — every script accepts its config
 path as a CLI argument and can read from anywhere — but README uses these
