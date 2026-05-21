@@ -48,3 +48,4 @@ desktop.ini
 *.tmp
 *.orig
 tmp/
+scripts/config/
