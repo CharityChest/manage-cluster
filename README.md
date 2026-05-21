@@ -14,6 +14,7 @@ The repo contains a matching pair of scripts:
 | `scripts/manage-albs.sh`        | Create or delete a set of Application Load Balancers from an INI-style config; on create, emits a DNS records template ready for `apply-dns-records.sh` and a service-LB template ready for `update-service-alb.sh`. |
 | `scripts/update-service-alb.sh` | Replace, clear, append, or detach one specific target group from the `loadBalancers` association on a set of ECS Fargate services, from an INI-style config. |
 | `scripts/apply-listeners.sh`    | Create or update ALB listeners (HTTP/HTTPS; forward / redirect / fixed-response default actions) from an INI-style config. |
+| `scripts/manage-vpce.sh`        | Create or delete a set of VPC endpoints (Interface and/or Gateway) from an INI-style config, optionally attaching a per-endpoint policy document on creation. |
 | `scripts/setup.sh`              | One-shot wrapper that runs the LB-layer setup in order (provision ALBs → listeners → wire services → DNS). |
 | `scripts/teardown.sh`           | One-shot wrapper that runs the LB-layer teardown in order (DNS delete → detach services → delete ALBs) with a drain wait between steps. |
 
@@ -462,6 +463,105 @@ Both scripts are idempotent. `shutdown.sh` skips services already at
 services already at the target count and an RDS instance already
 `available`/`starting`.
 
+## Managing VPC endpoints
+
+`manage-vpce.sh` creates or deletes a set of VPC endpoints from an INI-style
+config file. Interface endpoints (PrivateLink) cost ~$0.01/hour per endpoint
+**per AZ** even when idle, so deleting them during a long pause can save real
+money. Gateway endpoints (S3, DynamoDB) are free; managing them here is for
+completeness and symmetric teardown/setup.
+
+> **Drift warning.** If your VPC endpoints are owned by Terraform in
+> `../charity-chest`, deleting them with this script will cause drift on the
+> next `terraform apply`. Confirm ownership before pointing it at shared
+> infra.
+
+Config file format — one `[name]` section per endpoint:
+
+```ini
+# Interface endpoint with a per-endpoint policy.
+[cc-ecr-api-dev]
+type=Interface
+service_name=com.amazonaws.eu-central-1.ecr.api
+vpc_id=vpc-0123456789abcdef0
+subnets=subnet-0346805ef41afa4f1,subnet-0834675ec2670bf5f
+security_groups=sg-0e6894f14a502c771
+private_dns_enabled=true
+policy_file=policies/ecr-api.json
+tags=Env=dev,App=charity-chest
+
+# Gateway endpoint (S3) — needs route tables, no subnets/SGs/DNS.
+[cc-s3-dev]
+type=Gateway
+service_name=com.amazonaws.eu-central-1.s3
+vpc_id=vpc-0123456789abcdef0
+route_table_ids=rtb-0aaa,rtb-0bbb
+policy_file=policies/s3-readonly.json
+```
+
+Per-section keys:
+
+| Key                    | Required for         | Description                                                                 |
+| ---------------------- | -------------------- | --------------------------------------------------------------------------- |
+| `type`                 | both                 | `Interface` or `Gateway`                                                    |
+| `service_name`         | both                 | AWS service endpoint name, e.g. `com.amazonaws.<region>.ecr.api`            |
+| `vpc_id`               | both                 | Target VPC ID                                                               |
+| `subnets`              | Interface            | Comma-separated subnet IDs (one per AZ to use)                              |
+| `security_groups`      | Interface            | Comma-separated SG IDs                                                      |
+| `private_dns_enabled`  | Interface (optional) | `true` (default) or `false` — controls AWS's auto-published private DNS    |
+| `route_table_ids`      | Gateway              | Comma-separated route-table IDs the endpoint attaches to                    |
+| `policy_file`          | both (optional)      | Path to a JSON policy doc; relative paths resolve against the config file's directory. Omit for AWS's default full-access policy. |
+| `tags`                 | both (optional)      | Comma-separated `Key=Value` pairs. `Name` is set automatically from the section header and must not be repeated here. |
+
+The script refuses Interface-only keys on Gateway sections (and vice versa)
+up front rather than letting the AWS CLI reject them later.
+
+Create:
+
+```sh
+./scripts/manage-vpce.sh create ./scripts/config/vpce.conf
+```
+
+Delete (same config, only section names are read):
+
+```sh
+./scripts/manage-vpce.sh delete ./scripts/config/vpce.conf
+```
+
+Idempotency: each endpoint's identity is `(vpc_id, service_name)` — the
+natural primary key, since AWS only allows one endpoint per service per
+VPC. `create` skips endpoints that already exist for the same service (no
+modify is attempted — see below); `delete` skips endpoints that aren't
+present. The section header is applied as the `Name` tag at create time
+for Console readability, but it isn't used for lookup — so this script
+will find and reuse (or delete) endpoints that already exist in the VPC
+even if they were originally created from the Console, Terraform, or
+another tool without a Name tag.
+
+**Modify is intentionally out of scope.** Changing `service_name` or
+`vpc_id` requires a recreate, and rotating policies / subnets / SGs on a
+live endpoint is rare for the cost-management use case this script
+addresses. If you need an in-place policy rotation, run
+`aws ec2 modify-vpc-endpoint --policy-document file://...` directly. If you
+need to change subnets or SGs, delete and recreate via this script.
+
+**Optional in the LB pipeline.** `manage-vpce.sh` is wired into both
+`setup.sh` (optional 5th positional arg) and `teardown.sh` (optional 4th).
+It runs first on setup (VPCEs before ALBs, so any ECS task that comes up
+in the service-wire step has ECR / logs / secrets reachable) and last on
+teardown. Omit the arg on either wrapper to skip the VPCE step and keep
+the original 4-step / 3-step behaviour. Skipping is the right call when
+the VPCEs are managed elsewhere (Terraform in `../charity-chest`) or when
+you're only re-provisioning the LB shell. See
+[Pause vs. teardown](#pause-vs-teardown--dont-confuse-them) for when the
+arg is worth supplying.
+
+> **Teardown caveat**: `teardown.sh` does not stop ECS tasks. If you pass
+> the VPCE arg, scale services to 0 first (e.g. run `shutdown.sh`) — a
+> running task that depends on an endpoint will start failing the moment
+> the endpoint disappears. The wrapper logs a warning before its
+> confirmation prompt, but doesn't enforce the precondition.
+
 ## Setup and teardown sequences
 
 Two end-to-end pipelines. Config files live under `scripts/config/` by
@@ -469,9 +569,13 @@ convention.
 
 ### Setup — cold start, full pipeline
 
-Either run the four steps by hand:
+Either run the steps by hand:
 
 ```sh
+# 0. (Optional) Provision VPC endpoints — needed before ECS tasks try to
+#    reach ECR / CloudWatch logs / Secrets Manager / SSM from a private VPC.
+./scripts/manage-vpce.sh create ./scripts/config/vpce.conf
+
 # 1. Provision ALBs; emit DNS + service-LB templates.
 ./scripts/manage-albs.sh create \
     ./scripts/config/albs.conf \
@@ -492,38 +596,49 @@ HOSTED_ZONE_ID=Z3ABCXYZ \
 ASSUME_YES=1 WAIT_FOR_RDS=1 ./scripts/startup.sh
 ```
 
-…or use the wrapper that does all four in order:
+…or use the wrapper:
 
 ```sh
+# 4-step form (LB layer only, no VPCEs):
 HOSTED_ZONE_ID=Z3ABCXYZ \
     ./scripts/setup.sh \
         ./scripts/config/albs.conf \
         ./scripts/config/dns-records.txt \
         ./scripts/config/service-lbs.conf \
         ./scripts/config/listeners.conf
+
+# 5-step form (full provision including VPCEs first):
+HOSTED_ZONE_ID=Z3ABCXYZ \
+    ./scripts/setup.sh \
+        ./scripts/config/albs.conf \
+        ./scripts/config/dns-records.txt \
+        ./scripts/config/service-lbs.conf \
+        ./scripts/config/listeners.conf \
+        ./scripts/config/vpce.conf
 ```
 
-The four positional args are, in order: ALBs config (input), DNS records
-output, service-LB output, listeners config (input). The DNS and
-service-LB files are produced by step 1 and consumed by steps 3 and 4 —
-the wrapper threads them through. `setup.sh` confirms once up front and
-suppresses the per-script prompts via `ASSUME_YES=1`. Set
-`WAIT_FOR_ACTIVE=1` to make step 1 block until each new ALB reaches
-state `active` (2–5 min per ALB).
+Positional args: ALBs config (input), DNS records output, service-LB
+output, listeners config (input), and optionally a VPCE config (input).
+The DNS and service-LB files are produced by the ALB step and consumed
+by the service-wiring and DNS steps — the wrapper threads them through.
+`setup.sh` confirms once up front and suppresses the per-script prompts
+via `ASSUME_YES=1`. Set `WAIT_FOR_ACTIVE=1` to make the ALB step block
+until each new ALB reaches state `active` (2–5 min per ALB).
 
 If `albs.conf` doesn't declare any `ecs_service.*` blocks, the emitted
 service-LB file is header-only and the wrapper automatically **skips**
-step 3 (since `update-service-alb.sh` errors on a config with zero
-sections).
+the service-wiring step (since `update-service-alb.sh` errors on a config
+with zero sections).
 
-Order rationale: the ALB must exist before listeners can attach (step 1
-before 2). Services need their target group wired before the listener has
-healthy targets (step 3 before any user traffic). DNS goes last so
-external clients don't reach a half-built ALB.
+Order rationale: VPCEs are created first when present so that any ECS
+task started in the service-wiring step has ECR / logs / secrets
+reachable. The ALB must exist before listeners can attach. Services need
+their target group wired before the listener has healthy targets. DNS
+goes last so external clients don't reach a half-built ALB.
 
 ### Teardown — full removal of the LB layer
 
-Either run the three steps by hand:
+Either run the steps by hand:
 
 ```sh
 # 1. Delete DNS records pointing at the ALBs (stop new client traffic).
@@ -539,26 +654,45 @@ HOSTED_ZONE_ID=Z3ABCXYZ \
 #    of the cascade; target groups survive (they're independent resources
 #    and aren't managed by this repo).
 ./scripts/manage-albs.sh delete ./scripts/config/albs.conf
+
+# 4. (Optional) Delete VPC endpoints. Scale ECS services to 0 BEFORE this
+#    step (e.g. ./scripts/shutdown.sh) or running tasks will start failing.
+./scripts/manage-vpce.sh delete ./scripts/config/vpce.conf
 ```
 
-…or use the wrapper that does all three with a drain wait between
-steps 2 and 3:
+…or use the wrapper with a drain wait between the service-detach and
+ALB-delete steps:
 
 ```sh
+# 3-step form (LB layer only):
 HOSTED_ZONE_ID=Z3ABCXYZ \
     ./scripts/teardown.sh \
         ./scripts/config/dns-records-delete.txt \
         ./scripts/config/remove-albs-from-services.conf \
         ./scripts/config/albs.conf
+
+# 4-step form (also delete VPCEs — scale services to 0 first):
+HOSTED_ZONE_ID=Z3ABCXYZ \
+    ./scripts/teardown.sh \
+        ./scripts/config/dns-records-delete.txt \
+        ./scripts/config/remove-albs-from-services.conf \
+        ./scripts/config/albs.conf \
+        ./scripts/config/vpce.conf
 ```
 
-The wrapper takes three positional args (DNS file, services file, ALBs
-file) in the same order as the manual steps. It confirms once up front
-and then suppresses the per-script prompts via `ASSUME_YES=1` (set
-`ASSUME_YES=1` in the parent env to skip the wrapper's confirm too).
-`DRAIN_SECONDS` (default 30) controls the wait between detaching services
-and deleting the ALBs — set to 0 to skip if you've already verified the
-LB has drained.
+Positional args: DNS file, services file, ALBs file, and optionally a
+VPCE config. The wrapper confirms once up front and then suppresses the
+per-script prompts via `ASSUME_YES=1` (set `ASSUME_YES=1` in the parent
+env to skip the wrapper's confirm too). `DRAIN_SECONDS` (default 30)
+controls the wait between detaching services and deleting the ALBs — set
+to 0 to skip if you've already verified the LB has drained.
+
+> **Don't pass the VPCE arg with services still running.** `teardown.sh`
+> does not stop ECS tasks; it only detaches their LB association. A
+> running task that needs ECR / logs / secrets will start failing the
+> moment the VPCEs disappear. Run `./scripts/shutdown.sh` (or scale to 0
+> manually) before the 4-step form. The wrapper logs a warning in the
+> plan output but doesn't enforce the precondition.
 
 Each child script is idempotent, so the wrapper is safe to re-run after
 a mid-teardown failure: completed steps silently skip, and execution
@@ -602,12 +736,17 @@ remove_target_group_arn=arn:aws:elasticloadbalancing:eu-west-1:123:targetgroup/o
 - `shutdown.sh` / `startup.sh` — **pause/resume.** Scale ECS to 0 and stop
   RDS to save cost during planned downtime. ALB, listeners, and DNS stay in
   place. Use for nightly off-hours.
+- `manage-vpce.sh delete` / `create` — **deeper pause.** Removes interface
+  VPC endpoints (~$0.01/h per AZ each) so they stop accruing charges. Pair
+  with `shutdown.sh` only when the pause is long enough to justify the
+  recreate latency on resume (gateway endpoints are free — leave them).
 - The teardown above — **remove the ALB layer entirely.** ECS services and
   RDS persist, but external traffic has no entry point until you re-run
   the setup sequence. Use when actually decommissioning or migrating.
 
-If you want a one-command "go away for a week," that's `shutdown.sh`.
-If you want "rip the LB layer out," that's the teardown sequence above.
+If you want a one-command "go away for a week," that's `shutdown.sh`
+(optionally with `manage-vpce.sh delete`). If you want "rip the LB layer
+out," that's the teardown sequence above.
 
 ## What happens during shutdown
 
@@ -734,6 +873,31 @@ no additional IAM is required.
 If `default_action_type=forward` references a target group ARN whose
 listener-attachment is governed by a policy condition, also grant
 `elasticloadbalancing:RegisterTargets` on that target group.
+
+`manage-vpce.sh` additionally needs:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeVpcEndpoints",
+        "ec2:CreateVpcEndpoint",
+        "ec2:DeleteVpcEndpoints",
+        "ec2:CreateTags"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+`CreateVpcEndpoint` requires `Resource: "*"` because the endpoint ARN
+doesn't exist yet at call time. If `policy_file` is used, no extra IAM is
+needed — the policy is embedded in the endpoint resource, not attached as
+a separate object.
 
 ## Scheduling
 
