@@ -125,7 +125,7 @@ The records file is plain text — one record per non-comment line, columns
 `ACTION TYPE NAME TTL VALUE[|VALUE...]`. Multi-value record sets use `|` as
 the separator; TXT values include their surrounding quotes:
 
-```
+```text
 # api swap
 upsert  A      api.example.com.       300  192.0.2.1
 upsert  A      multi.example.com.     300  192.0.2.1|192.0.2.2
@@ -139,7 +139,7 @@ To point a record at an **AWS resource** (ALB, NLB, CloudFront, …), use an
 alias record. Alias rows have a different column layout — no TTL, no value
 list, instead the target's DNS name and its canonical hosted zone ID:
 
-```
+```text
 # Columns: alias  TYPE  NAME  TARGET_ZONE_ID  TARGET_DNS_NAME  [EVAL_HEALTH]
 alias  A  api.example.com.  Z32O12XQLNTSW2  dualstack.my-alb-1234.eu-west-1.elb.amazonaws.com.
 alias  A  www.example.com.  Z2FDTNDATAQYW2  d111111abcdef8.cloudfront.net.                       true
@@ -230,8 +230,13 @@ HOSTED_ZONE_ID=Z3ABCXYZ ./scripts/apply-dns-records.sh ./alb-records.txt
 ```
 
 Either output path can be omitted (the template prints to stdout instead).
-If a section declares no `dns_names` or no `ecs_service.*` block, the
-corresponding template just isn't written.
+When an output path *is* provided, `manage-albs.sh` always writes the
+template's header to that path — even when no ALB declares `dns_names` (or
+no `ecs_service.*` block), in which case the file ends up header-only with
+no record/section lines. This is deliberate: `setup.sh` detects a
+header-only service-LB file (no `[section]` headers) and auto-skips the
+service-wiring step rather than feeding `update-service-alb.sh` an empty
+config.
 
 ### Deleting ALBs
 
@@ -372,7 +377,7 @@ are intentionally out of scope. Use Terraform for those.
 There is no separate "attach listener to service" step. The wiring is the
 **shared target group ARN**:
 
-```
+```text
    listener (alb:port)
       │
       │ default forward ──► target group ARN ◄── update-service-alb.sh
@@ -565,7 +570,7 @@ continues from where it stopped.
 `apply-dns-records.sh` pre-checks deletes against current zone state and
 skips ones that are already absent, so this is safe to re-run.
 
-```
+```text
 delete  A     api.charitychest.com.
 delete  AAAA  api.charitychest.com.
 delete  A     www.charitychest.com.

@@ -352,7 +352,9 @@ apply_one_listener() {
     fi
   fi
 
-  if [[ -z "${row}" ]]; then
+  local listener_arn="${row%%$'\t'*}"
+
+  if [[ -z "${row}" || "${listener_arn}" == "None" ]]; then
     log "listener ${lst} (${alb_name}:${port}): creating"
     "${AWS[@]}" elbv2 create-listener \
       --load-balancer-arn "${alb_arn}" \
@@ -362,7 +364,6 @@ apply_one_listener() {
     return
   fi
 
-  local listener_arn="${row%%$'\t'*}"
   local current_state="${row#*$'\t'}"
   local desired
   desired="$(desired_listener_state "${lst}")"
